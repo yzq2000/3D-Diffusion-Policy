@@ -20,13 +20,12 @@ import socket
 import pickle
 from rosbag_reader import RosbagReader
 
-
+# import visualizer
 
 def farthest_point_sampling(points, num_points=1024, use_cuda=True):
     K = [num_points]
     if use_cuda:
         points = torch.from_numpy(points).cuda()
-        print("debug farthest_point_sampling points", points)
         sampled_points, indices = torch3d_ops.sample_farthest_points(points=points.unsqueeze(0), K=K)
         sampled_points = sampled_points.squeeze(0)
         sampled_points = sampled_points.cpu().numpy()
@@ -38,45 +37,37 @@ def farthest_point_sampling(points, num_points=1024, use_cuda=True):
 
     return sampled_points, indices
 
-def preprocess_point_cloud(points, use_cuda=True):
-    points = np.asarray(points.points)
-    
-    num_points = 1024
+def preprocess_point_cloud(point_cloud, extrinsics_matrix, use_cuda=True):
+    points = np.asarray(point_cloud.points)
 
-    extrinsics_matrix = np.array([[ 0.5213259,  -0.84716441,  0.10262438,  0.04268034],
-                                  [ 0.25161211,  0.26751035,  0.93012341,  0.15598059],
-                                  [-0.81542053, -0.45907589,  0.3526169,   0.47807532],
-                                  [ 0.,          0.,          0.,          1.        ]])
-
-
-    WORK_SPACE = [
-        [0.65, 1.1],
-        [0.45, 0.66],
-        [-0.7, 0]
-    ]
+    num_points = 1024    
 
     # scale
-    point_xyz = points[..., :3]*0.0002500000118743628
+    point_xyz = points[..., :3]
     point_homogeneous = np.hstack((point_xyz, np.ones((point_xyz.shape[0], 1))))
     point_homogeneous = np.dot(point_homogeneous, extrinsics_matrix)
     point_xyz = point_homogeneous[..., :-1]
     points[..., :3] = point_xyz
-    
-     # crop
-    print("debug before crop points", points.shape)
-    points = points[np.where((points[..., 0] > WORK_SPACE[0][0]) & (points[..., 0] < WORK_SPACE[0][1]) &
-                                (points[..., 1] > WORK_SPACE[1][0]) & (points[..., 1] < WORK_SPACE[1][1]) &
-                                (points[..., 2] > WORK_SPACE[2][0]) & (points[..., 2] < WORK_SPACE[2][1]))]
 
-    
-    print("debug after crop points", points.shape)
+    # crop if needed
+    # points = points * 0.0002500000118743628
+    # WORK_SPACE = [
+    #     [0.65, 1.1],
+    #     [0.45, 0.66],
+    #     [-0.7, 0]
+    # ]
+    # points = points[np.where((points[..., 0] > WORK_SPACE[0][0]) & (points[..., 0] < WORK_SPACE[0][1]) &
+    #                             (points[..., 1] > WORK_SPACE[1][0]) & (points[..., 1] < WORK_SPACE[1][1]) &
+    #                             (points[..., 2] > WORK_SPACE[2][0]) & (points[..., 2] < WORK_SPACE[2][1]))]
+
+    # visualizer.visualize_pointcloud(points)
 
     points_xyz = points[..., :3]
-    print("debug point_xyz", point_xyz)
     points_xyz, sample_indices = farthest_point_sampling(points_xyz, num_points, use_cuda)
     sample_indices = sample_indices.cpu()
     points_rgb = points[sample_indices, 3:][0]
     points = np.hstack((points_xyz, points_rgb))
+    # print(points.shape)
     return points
    
 def preproces_image(image):
@@ -118,10 +109,21 @@ def process_point_cloud(camera_info_msgs, rgb_images, depth_images):
     # print("all_point_clouds_shape", all_point_clouds.shape)
     return all_point_clouds
 
+def get_extrinsics_matrix(camera_info):
+    R = np.reshape(camera_info.R, (3, 3))
+    P = np.reshape(camera_info.P, (3, 4))
+    extrinsics_matrix = np.hstack((R, P[:, 3].reshape(3, 1)))
+    extrinsics_matrix = np.vstack((extrinsics_matrix, np.array([0, 0, 0, 1])))
+    return extrinsics_matrix
 
-expert_data_path = '/home/a/Projects/3D-Diffusion-Policy/3D-Diffusion-Policy/data/test'
-save_data_path = '/home/a/Projects/3D-Diffusion-Policy/3D-Diffusion-Policy/data/test.zarr'
-demo_dirs = ['/home/a/Projects/3D-Diffusion-Policy/3D-Diffusion-Policy/data_loader/test_bag_2024-12-20-15-47-10.bag']
+def read_file_to_list(file_path):
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+    return [line.strip() for line in lines]
+
+save_data_path = '/home/a/Projects/Improved-3D-Diffusion-Policy/Improved-3D-Diffusion-Policy/data/tiangong_dexhand_grasp_82.zarr'
+demo_dirs = read_file_to_list("/home/a/Projects/3D-Diffusion-Policy/3D-Diffusion-Policy/data_loader/bag_file_list.txt")
+print("\n".join(demo_dirs))
 
 # storage
 total_count = 0
@@ -164,9 +166,9 @@ for demo_dir in demo_dirs:
     print("robot_states_shape", robot_states.shape)
     actions = [robot_states[i+1] - robot_states[i] for i in range(len(robot_states)-1)] + [np.zeros_like(robot_states[0])]
     camera_info_msgs = reader.export_aligned_msgs('/camera/color/camera_info')
-    point_cloud_msgs = process_point_cloud(camera_info_msgs, rgb_images, depth_images)
+    point_clouds = process_point_cloud(camera_info_msgs, rgb_images, depth_images)
     
-    demo_length = len(point_cloud_msgs)
+    demo_length = len(point_clouds)
     for step_idx in tqdm.tqdm(range(demo_length)):
        
         total_count += 1
@@ -174,11 +176,13 @@ for demo_dir in demo_dirs:
         obs_depth = depth_images[step_idx]
         obs_image = preproces_image(obs_image)
         obs_depth = preproces_image(np.expand_dims(obs_depth, axis=-1)).squeeze(-1)
-        obs_pointcloud = point_cloud_msgs[step_idx]
+        obs_camera_info = camera_info_msgs[step_idx]
+        obs_extrinsics_matrix = get_extrinsics_matrix(obs_camera_info)
+        obs_pointcloud = point_clouds[step_idx]
         robot_state = robot_states[step_idx]
         action = actions[step_idx]
     
-        obs_pointcloud = preprocess_point_cloud(obs_pointcloud, use_cuda=True)
+        obs_pointcloud = preprocess_point_cloud(obs_pointcloud, obs_extrinsics_matrix, use_cuda=True)
         img_arrays.append(obs_image)
         action_arrays.append(action)
         point_cloud_arrays.append(obs_pointcloud)
